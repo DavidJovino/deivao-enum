@@ -33,8 +33,7 @@ from reporting.notify import NotifyManager
 from config.settings import (
     DEFAULT_THREADS, 
     DEFAULT_TIMEOUT, 
-    DEFAULT_LOG_LEVEL,
-    BASE_OUTPUT_DIR
+    DEFAULT_LOG_LEVEL
 )
 
 class BugBountyEnum:
@@ -90,8 +89,6 @@ class BugBountyEnum:
                 name="deivao-enum",
                 log_file=self.args.log_file,
                 level="DEBUG" if self.args.verbose else DEFAULT_LOG_LEVEL,
-                max_bytes=10 * 1024 * 1024,  # 10MB
-                backup_count=5
             )
         except Exception as e:
             print(f"Falha crítica ao configurar logger: {str(e)}", file=sys.stderr)
@@ -102,7 +99,7 @@ class BugBountyEnum:
         try:
             # Diretório base organizado por data
             self.output_dir = os.path.expanduser(
-                os.path.join(BASE_OUTPUT_DIR, self.domain)
+                os.path.join("~/Documents/Bugbounty", self.domain)
             )
             
             # Criar estrutura de diretórios

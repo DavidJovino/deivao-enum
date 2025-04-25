@@ -1,6 +1,6 @@
 #!/bin/bash
 
-INPUT_FILE="/app/alvos.txt"
+INPUT_FILE="${1:-/root/Documents/Bugbounty/alvos.txt}"
 
 if [ ! -f "$INPUT_FILE" ]; then
   echo "❌ Arquivo de domínios não encontrado: $INPUT_FILE"
@@ -20,6 +20,6 @@ while IFS= read -r domain || [ -n "$domain" ]; do
 
   [ -z "$domain" ] && echo "⚠️ Linha em branco, ignorada" && continue
 
-  echo "▶️ Executando recon para: $domain"
-  python bug_bounty_pipeline.py "$domain"
+  echo "▶️ Executando Enum para: $domain"
+  python main.py "$domain"
 done < "$INPUT_FILE"
