@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  deivao-recon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deivao-enum
+    volumes:
+      - ~/Documents/Bugbounty:/root/Documents/Bugbounty
+    working_dir: /app
+    stdin_open: true
+    tty: true
