@@ -23,24 +23,9 @@ COLORS = {
 
 # Configurações de módulos
 MODULES = {
-    "recon": {
-        "name": "Reconhecimento de Subdomínios",
-        "description": "Descobre subdomínios usando múltiplas ferramentas",
-        "enabled": True
-    },
     "enum": {
         "name": "Enumeração de Endpoints",
         "description": "Identifica URLs, diretórios e endpoints",
-        "enabled": True
-    },
-    "scan": {
-        "name": "Escaneamento de Vulnerabilidades",
-        "description": "Detecta vulnerabilidades usando várias ferramentas",
-        "enabled": True
-    },
-    "specific": {
-        "name": "Testes Específicos",
-        "description": "Realiza testes direcionados para vulnerabilidades específicas",
         "enabled": True
     }
 }

@@ -128,8 +128,6 @@ class BugBountyEnum:
         try:
             self.executor = CommandExecutor(
                 logger=self.logger,
-                timeout=self.args.timeout,
-                max_workers=self.args.threads
             )
             
             self.tool_checker = ToolChecker(self.logger)
@@ -140,8 +138,7 @@ class BugBountyEnum:
                 self._load_notification_config()
                 
             self.report_generator = ReportGenerator(
-                logger=self.logger,
-                template_dir=os.path.join(root_dir, "reporting", "templates")
+                logger=self.logger
             )
             
         except Exception as e:

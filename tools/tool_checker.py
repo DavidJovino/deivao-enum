@@ -3,10 +3,7 @@ Módulo de verificação de ferramentas para a pipeline de Bug Bounty.
 Responsável por verificar a disponibilidade e versão das ferramentas necessárias.
 """
 
-import os
-import sys
-import subprocess
-import shutil
+
 from pathlib import Path
 from core.logger import Logger
 from core.executor import CommandExecutor
@@ -45,10 +42,6 @@ class ToolChecker:
         
         tool_info = TOOLS[tool_name]
         
-        # Verificar se a ferramenta requer tratamento especial
-        if requires_special_handling(tool_name):
-            return self._check_special_tool(tool_name, tool_info)
-        
         # Verificar se a ferramenta tem um comando específico
         command = tool_info.get("command", tool_name)
         if not command:
@@ -68,91 +61,6 @@ class ToolChecker:
             if tool_name not in self.missing_tools:
                 self.missing_tools.append(tool_name)
             return False
-    
-    def _check_special_tool(self, tool_name, tool_info):
-        """
-        Verifica ferramentas que requerem tratamento especial.
-        
-        Args:
-            tool_name (str): Nome da ferramenta
-            tool_info (dict): Informações da ferramenta
-            
-        Returns:
-            bool: True se a ferramenta está disponível, False caso contrário
-        """
-        self.logger.debug(f"Verificando ferramenta especial: {tool_name}")
-        
-        # Caso especial: XXEinjector
-        if tool_name == "xxeinjector":
-            return self._check_xxeinjector()
-        
-        # Caso especial: XSRFProbe
-        elif tool_name == "xsrfprobe":
-            # Verificar se XSRFProbe está instalado via pip
-            result = self.executor.execute("pip3 show xsrfprobe", shell=True)
-            if result["success"] and "Name: xsrfprobe" in result["stdout"]:
-                self.logger.debug("XSRFProbe encontrado via pip")
-                if "xsrfprobe" not in self.available_tools:
-                    self.available_tools.append("xsrfprobe")
-                return True
-            else:
-                self.logger.warning("XSRFProbe não encontrado, tentando instalar automaticamente")
-                install_result = self.executor.execute("pip3 install xsrfprobe", shell=True)
-                if install_result["success"]:
-                    self.logger.success("XSRFProbe instalado com sucesso")
-                    if "xsrfprobe" not in self.available_tools:
-                        self.available_tools.append("xsrfprobe")
-                    return True
-                else:
-                    self.logger.error(f"Falha ao instalar XSRFProbe: {install_result.get('stderr', 'Erro desconhecido')}")
-                    self.alternative_tools["xsrfprobe"] = "python_csrf_scanner"
-                    return False
-        
-        # Caso padrão para outras ferramentas especiais
-        else:
-            command = tool_info.get("command", tool_name)
-            exists = self.executor.check_command_exists(command)
-            
-            if exists:
-                self.logger.debug(f"Ferramenta especial {tool_name} encontrada")
-                if tool_name not in self.available_tools:
-                    self.available_tools.append(tool_name)
-                return True
-            else:
-                self.logger.debug(f"Ferramenta especial {tool_name} não encontrada")
-                if tool_name not in self.missing_tools:
-                    self.missing_tools.append(tool_name)
-                return False
-    
-    def _check_xxeinjector(self):
-        """
-        Verifica especificamente a ferramenta XXEinjector.
-        
-        Returns:
-            bool: True se XXEinjector está disponível, False caso contrário
-        """
-        # Verificar se o arquivo Ruby existe
-        xxe_path = os.path.expanduser("~/tools/XXEinjector/XXEinjector.rb")
-        if os.path.isfile(xxe_path):
-            # Verificar se Ruby está instalado
-            if self.executor.check_command_exists("ruby"):
-                # Verificar dependências do Ruby
-                result = self.executor.execute("gem list | grep nokogiri", shell=True)
-                if result["success"] and "nokogiri" in result["stdout"]:
-                    self.logger.debug("XXEinjector encontrado e todas as dependências estão instaladas")
-                    if "xxeinjector" not in self.available_tools:
-                        self.available_tools.append("xxeinjector")
-                    return True
-                else:
-                    self.logger.warning("XXEinjector encontrado, mas falta a dependência nokogiri")
-            else:
-                self.logger.warning("XXEinjector encontrado, mas Ruby não está instalado")
-        
-        self.logger.warning("XXEinjector não encontrado ou não utilizável, será usada implementação alternativa em Python")
-        if "xxeinjector" not in self.missing_tools:
-            self.missing_tools.append("xxeinjector")
-        self.alternative_tools["xxeinjector"] = "python_xxe_scanner"
-        return False
     
     def check_tools_for_module(self, module_name):
         """
@@ -340,7 +248,7 @@ class ToolChecker:
             list: Lista de ferramentas críticas faltantes
         """
         critical_tools = []
-        for module in ["recon", "enum", "scan"]:
+        for module in ["enum"]:
             tools = get_tools_for_module(module)
             for tool in tools:
                 if tool not in self.available_tools and tool not in self.alternative_tools:

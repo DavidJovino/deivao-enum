@@ -406,7 +406,7 @@ class ToolInstaller:
         
         return True
     
-    def _configure_xxeinjector(self):
+
         """
         Configura o XXEinjector após a instalação.
         
