@@ -10,19 +10,19 @@ Versão corrigida com:
 import os
 import re
 import random
+import shlex
+from tqdm import tqdm
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import List, Dict, Optional, Callable, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from core.logger import Logger
 from core.executor import CommandExecutor
 from tools.tool_checker import ToolChecker
 
 class EndpointEnum:
-    def __init__(self, logger: Optional[Logger] = None, threads: int = 10, 
-                 timeout: int = 300, allow_ipv6: bool = False):
+    def __init__(self, logger: Optional[Logger] = None, threads: int = 10, timeout: int = 300, allow_ipv6: bool = False):
         self.logger = logger or Logger("endpoint_enum")
         self.executor = CommandExecutor(self.logger)
         self.threads = threads
@@ -31,7 +31,6 @@ class EndpointEnum:
         self.start_time = datetime.now()
 
         self.tools_status = self._verify_tools()
-
         self.endpoints: List[str] = []
         self.active_endpoints: List[str] = []
         self.directories: List[str] = []
@@ -44,7 +43,7 @@ class EndpointEnum:
             'httpx': 'httpx -version',
             'ffuf': 'ffuf -h',
             'feroxbuster': 'feroxbuster -h',
-            'gau': 'gau -version',
+            'gau': 'gau -h',
             'waybackurls': 'waybackurls -h'
         }
         available = {}
@@ -53,10 +52,41 @@ class EndpointEnum:
             available[tool] = result['success']
             if not result['success']:
                 self.logger.warning(f"Ferramenta {tool} não disponível")
+
         return {
             'available': [k for k, v in available.items() if v],
-            'missing': [k for k, v in available.items() if not v]
+            'missing': [k for k, v in available.items() if not v],
+            'crawlers': ['katana', 'hakrawler'],
+            'historical': ['gau', 'waybackurls'],
+            'fuzzers': ['feroxbuster', 'ffuf']
         }
+
+    def _sanitize_host(self, host: str) -> str:
+        """Remove metadados como [200] [size] etc."""
+        return host.split('[')[0].strip()
+
+    def _sanitize_url(self, raw_url: str) -> str:
+        """Remove códigos ANSI e dados extras de uma URL."""
+        # Remove caracteres de cor (ANSI)
+        raw_url = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', raw_url)
+        # Remove pedaços que parecem [200] [16766] [exemplo.com]
+        url = raw_url.split(' [')[0].strip()
+        return url
+
+    def _sanitize_file(self, file_path: str):
+        """Sanitiza todas as linhas de um arquivo, removendo códigos ANSI e dados extras, mantendo apenas URLs válidas."""
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+
+        sanitized_lines = []
+        for line in lines:
+            clean_line = self._sanitize_url(line.strip())
+            if clean_line and self._validate_url(clean_line):  # <<< AQUI
+                sanitized_lines.append(clean_line)
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for line in sanitized_lines:
+                f.write(line + '\n')
 
     def _ensure_url_scheme(self, url: str) -> str:
         url = url.strip()
@@ -66,472 +96,155 @@ class EndpointEnum:
 
     def _validate_url(self, url: str) -> bool:
         try:
-            if not re.match(r'^https?://[^\s/$.?#].[^\s]*$', url, re.IGNORECASE):
+            if not re.match(r'^https?://[\w.-]+(?:/[^\s]*)?$', url, re.IGNORECASE):
                 return False
             parsed = urlparse(url)
             if not all([parsed.scheme, parsed.netloc]):
                 return False
             if any(block in parsed.netloc for block in ['localhost', '127.', '::1', '0.0.0.0']):
-                self.logger.warning(f"URL bloqueada (local/reservada): {url}")
+                self.logger.warning(f"URL bloqueada: {url}")
                 return False
-            if not re.match(r'^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$', parsed.netloc.split(':')[0], re.IGNORECASE):
-                if not self.allow_ipv6 or ':' not in parsed.netloc:
-                    return False
             return True
         except Exception as e:
             self.logger.debug(f"Erro ao validar URL {url}: {str(e)}")
             return False
 
-    def _prepare_hosts_file(self, input_file: str) -> Optional[str]:
-        valid_hosts = []
-        try:
-            with open(input_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    url = self._ensure_url_scheme(line.strip())
-                    if self._validate_url(url):
-                        valid_hosts.append(url)
-        except UnicodeDecodeError:
-            self.logger.error(f"Erro de decodificação no arquivo {input_file}")
-            return None
-        if not valid_hosts:
-            self.logger.error("Nenhuma URL válida encontrada")
-            return None
-        temp_file = "/tmp/valid_hosts.txt"
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(valid_hosts))
-        return temp_file
-
     def run(self, hosts_file: str, output_dir: str) -> Dict:
-        if not os.path.exists(hosts_file):
-            self.logger.error(f"Arquivo não encontrado: {hosts_file}")
-            return {"success": False, "error": "Arquivo não encontrado"}
-
-        valid_hosts = self._prepare_hosts_file(hosts_file)
-        if not valid_hosts:
-            return {"success": False, "error": "Nenhum host válido"}
-
         os.makedirs(output_dir, exist_ok=True)
+
         endpoints_file = os.path.join(output_dir, "endpoints.txt")
         active_file = os.path.join(output_dir, "active_endpoints.txt")
         dirs_file = os.path.join(output_dir, "directories.txt")
         params_file = os.path.join(output_dir, "parameters.txt")
 
-        try:
-            # Aqui entraria a lógica real de enumeração
-            # Mock simples:
-            self.endpoints = ["http://example.com/login", "http://example.com/dashboard"]
-            self.active_endpoints = self.endpoints[:1]
-            self.directories = ["/admin", "/assets"]
-            self.parameters = ["id", "page"]
+        # Crawling
+        self._run_crawlers(hosts_file, endpoints_file)
 
-            with open(endpoints_file, 'w') as f:
-                f.write('\n'.join(self.endpoints))
-            with open(active_file, 'w') as f:
-                f.write('\n'.join(self.active_endpoints))
-            with open(dirs_file, 'w') as f:
-                f.write('\n'.join(self.directories))
-            with open(params_file, 'w') as f:
-                f.write('\n'.join(self.parameters))
+        # URLs históricas
+        self._run_historical_urls(hosts_file, endpoints_file)
 
-            final_enum_path = os.path.join(output_dir, "final_enum.txt")
-            with open(final_enum_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(self.active_endpoints or self.endpoints))
-            self.logger.success(f"Arquivo final da enumeração salvo em: {final_enum_path}")
+        # Ativos
+        self._check_active_endpoints(endpoints_file, active_file)
 
-            return {
-                "success": True,
-                "final_file": final_enum_path,
-                "endpoints": self.endpoints,
-                "active_endpoints": self.active_endpoints,
-                "directories": self.directories,
-                "parameters": self.parameters
-            }
+        # Fuzzing
+        self._run_directory_fuzzing(active_file, dirs_file)
 
-        except Exception as e:
-            self.logger.error(f"Erro durante enumeração: {str(e)}")
-            return {"success": False, "error": str(e)}
+        # Parâmetros
+        self._extract_parameters(endpoints_file, params_file)
 
-    def _run_crawler(self, hosts_file: str, output_file: str) -> bool:
-        """Executa crawling com fallback inteligente entre ferramentas."""
-        crawlers = self.available_tools.get('crawlers', [])
-        
-        for tool in crawlers:
+        return self._consolidate_results(endpoints_file, active_file, dirs_file, params_file)
+
+    def _run_crawlers(self, hosts_file: str, output_file: str):
+        if 'katana' in self.tools_status['available']:
+            cmd = f"katana -list {hosts_file} -o {output_file}.katana"
+            self.executor.execute(cmd, timeout=self.timeout)
+        if 'hakrawler' in self.tools_status['available']:
+            cmd = f"cat {hosts_file} | hakrawler -t {self.threads} > {output_file}.hakrawler"
+            self.executor.execute(cmd, timeout=self.timeout, shell=True)
+        # Combinar resultados
+        self.executor.execute(f"cat {output_file}.katana {output_file}.hakrawler | sort -u > {output_file}", shell=True)
+
+    def _run_historical_urls(self, hosts_file: str, output_file: str):
+        tool = next((t for t in self.tools_status['historical'] if t in self.tools_status['available']), None)
+        if tool == 'gau':
+            cmd = f"cat {hosts_file} | cut -d/ -f3 | gau > {output_file}.gau"
+        elif tool == 'waybackurls':
+            cmd = f"cat {hosts_file} | cut -d/ -f3 | waybackurls > {output_file}.wayback"
+        else:
+            return
+        self.executor.execute(cmd, timeout=self.timeout, shell=True)
+        self.executor.execute(f"cat {output_file}* | sort -u >> {output_file}", shell=True)
+
+    def _check_active_endpoints(self, input_file: str, output_file: str, max_threads: int = 30):
+        """
+        Sanitiza e valida endpoints individualmente usando múltiplas threads para alta performance, com barra de progresso.
+        """
+        self._sanitize_file(input_file)
+
+        with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        def validate_url(url):
             try:
-                if tool == 'katana':
-                    cmd = (
-                        f"katana -list {hosts_file} -jc -kf -d 3 "
-                        f"-t {self.threads} -o {output_file} -timeout {self.timeout//2}"
-                    )
-                elif tool == 'hakrawler':
-                    cmd = f"hakrawler -list {hosts_file} -t {self.threads} > {output_file}"
-                
-                result = self.executor.execute(cmd, timeout=self.timeout, shell=(tool != 'katana'))
-                
-                if result['success'] and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                    self.logger.success(f"Crawling com {tool} obteve resultados")
-                    return True
-                    
+                command = f"echo {shlex.quote(url)} | httpx -silent -status-code -content-length -title"
+                result = self.executor.execute(command, timeout=self.timeout, shell=True)
+                if result["success"] and result["stdout"].strip():
+                    return (url, True)
+                return (url, False)
             except Exception as e:
-                self.logger.warning(f"Erro com {tool}: {str(e)}")
-                continue
-                
-        self.logger.error("Todos os crawlers falharam")
-        return False
-    
-    def _run_historical_urls(self, hosts_file, output_file):
-        """
-        Obtém URLs históricas usando waybackurls ou gau.
-        
-        Args:
-            hosts_file (str): Arquivo com lista de hosts
-            output_file (str): Arquivo de saída para endpoints
+                self.logger.warning(f"Erro ao validar {url}: {e}")
+                return (url, False)
+
+        valid_lines = []
+        invalid_lines = []
+
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            futures = [executor.submit(validate_url, url) for url in lines]
             
-        Returns:
-            bool: True se a obtenção de URLs históricas foi executada com sucesso, False caso contrário
-        """
-        self.logger.step("Obtendo URLs históricas")
-        
-        # Verificar se waybackurls ou gau estão disponíveis
-        if "gau" in self.tools_status["available"]:
-            historical_tool = "gau"
-        elif "waybackurls" in self.tools_status["available"]:
-            historical_tool = "waybackurls"
-        else:
-            self.logger.warning("Nenhuma ferramenta de URLs históricas disponível, pulando etapa")
-            return False
-        
-        # Arquivo temporário para resultados
-        historical_output = os.path.join(os.path.dirname(output_file), f"{historical_tool}_output.txt")
-        
-        # Extrair domínios do arquivo de hosts
-        domains_file = os.path.join(os.path.dirname(output_file), "domains.txt")
-        command = f"cat {hosts_file} | cut -d/ -f3 | sort -u > {domains_file}"
-        result = self.executor.execute(command, timeout=10, shell=True)
-        
-        if not result["success"] or not os.path.exists(domains_file) or os.path.getsize(domains_file) == 0:
-            self.logger.error("Falha ao extrair domínios do arquivo de hosts")
-            return False
-        
-        # Executar ferramenta de URLs históricas
-        if historical_tool == "gau":
-            command = f"cat {domains_file} | gau --threads {self.threads} > {historical_output}"
-            result = self.executor.execute(command, timeout=self.timeout, shell=True)
+            # USAR tqdm para barra de progresso!
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Validando endpoints", unit="URL"):
+                url, is_valid = future.result()
+                if is_valid:
+                    valid_lines.append(url)
+                else:
+                    invalid_lines.append(url)
 
-            if not result["success"]:
-                self.logger.error(f"Falha ao executar gau: {result['stderr']}")
-                return False
+        # Salvar os válidos
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for url in valid_lines:
+                f.write(url + '\n')
 
-        else:  # waybackurls
-            self.logger.info("Executando waybackurls por subdomínio (modo individual)")
-            with open(domains_file, "r", encoding="utf-8", errors="ignore") as f:
-                domains = [line.strip() for line in f if line.strip()]
+        # Salvar os inválidos
+        if invalid_lines:
+            error_file = output_file.replace('.txt', '_erros.txt')
+            with open(error_file, 'w', encoding='utf-8') as f:
+                for url in invalid_lines:
+                    f.write(url + '\n')
+            self.logger.info(f"Alguns endpoints inválidos foram encontrados. Veja: {error_file}")
 
-            temp_result_file = historical_output + ".tmp"
+        self.logger.info(f"Check concluído: {len(valid_lines)} válidos, {len(invalid_lines)} inválidos (threads: {max_threads})")
 
-            with open(temp_result_file, "w") as out_file:
-                for domain in domains:
-                    cmd = f"echo {domain} | waybackurls"
-                    result = self.executor.execute(cmd, timeout=60, shell=True)
-
-                    if result["success"]:
-                        out_file.write(result["stdout"])
-                    else:
-                        self.logger.warning(f"waybackurls falhou para {domain}: {result['stderr']}")
-
-            # Ordenar e deduplicar
-            command = f"cat {temp_result_file} | sort -u > {historical_output}"
-            result = self.executor.execute(command, timeout=20, shell=True)
-
-            if not result["success"]:
-                self.logger.error(f"Erro ao ordenar resultados do waybackurls: {result['stderr']}")
-                return False
-
-            if os.path.exists(temp_result_file):
-                os.remove(temp_result_file)
-
-        
-        # Verificar se o arquivo foi criado
-        if not os.path.exists(historical_output) or os.path.getsize(historical_output) == 0:
-            self.logger.warning(f"Nenhuma URL histórica encontrada com {historical_tool}")
-            return False
-        
-        # Adicionar resultados ao arquivo de endpoints
-        command = f"cat {historical_output} >> {output_file}"
-        result = self.executor.execute(command, timeout=10)
-        
-        if not result["success"]:
-            self.logger.error(f"Falha ao adicionar resultados do {historical_tool} ao arquivo de endpoints: {result['stderr']}")
-            return False
-        
-        # Contar URLs históricas
-        with open(historical_output, "r", encoding="utf-8", errors="ignore") as f:
-            urls = f.read().splitlines()
-        
-        self.logger.success(f"Encontradas {len(urls)} URLs históricas com {historical_tool}")
-        return True
-    
-    def _run_directory_fuzzing(self, hosts_file, output_file):
-        """
-        Executa fuzzing de diretórios usando ffuf ou feroxbuster.
-        
-        Args:
-            hosts_file (str): Arquivo com lista de hosts
-            output_file (str): Arquivo de saída para diretórios
-            
-        Returns:
-            bool: True se o fuzzing foi executado com sucesso, False caso contrário
-        """
-        self.logger.step("Executando fuzzing de diretórios")
-        
-        # Verificar se ffuf ou feroxbuster estão disponíveis
-        if "ffuf" in self.tools_status["available"]:
-            fuzzer = "ffuf"
-        elif "feroxbuster" in self.tools_status["available"]:
-            fuzzer = "feroxbuster"
-        else:
-            self.logger.warning("Nenhum fuzzer disponível, pulando fuzzing de diretórios")
-            return False
-        
-        # Verificar se o arquivo de hosts existe
-        if not hosts_file or not os.path.exists(hosts_file) or os.path.getsize(hosts_file) == 0:
-            self.logger.warning("Arquivo de hosts vazio ou não encontrado, pulando fuzzing de diretórios")
-            return False
-        
-        # Arquivo temporário para resultados
-        fuzzer_output = os.path.join(os.path.dirname(output_file), f"{fuzzer}_output.txt")
-        
-        # Diretório base das wordlists (setado no Docker)
+    def _run_directory_fuzzing(self, hosts_file: str, output_file: str):
+        fuzzer = next((t for t in self.tools_status['fuzzers'] if t in self.tools_status['available']), None)
+        if not fuzzer:
+            return
         wordlists_dir = os.environ.get("WORDLISTS_DIR", "/app/wordlists")
-
-        # Caminhos alternativos
-        wordlist_candidates = [
-            os.path.join(wordlists_dir, "Discovery/Web-Content/common.txt"),
-            os.path.join(wordlists_dir, "Discovery/Web-Content/directory-list-2.3-medium.txt")
-        ]
-
-        # Verifica qual wordlist existe
-        wordlist = None
-        for candidate in wordlist_candidates:
-            if os.path.exists(candidate):
-                wordlist = candidate
-                break
-
-        if not wordlist:
-            self.logger.warning("Nenhuma wordlist encontrada, pulando fuzzing de diretórios")
-            return False
-
-        
-        # Ler hosts do arquivo
-        with open(hosts_file, "r", encoding="utf-8", errors="ignore") as f:
-            hosts = f.read().splitlines()
-        
-        # Limitar número de hosts para fuzzing
-        max_hosts = 5
-        if len(hosts) > max_hosts:
-            self.logger.info(f"Limitando fuzzing para {max_hosts} hosts aleatórios")
-            hosts = random.sample(hosts, max_hosts)
-        
-        # Executar fuzzing para cada host
-        success = False
+        wordlist = os.path.join(wordlists_dir, "Discovery/Web-Content/common.txt")
+        with open(hosts_file, 'r') as f:
+            hosts = [self._sanitize_host(line.strip()) for line in f if line.strip()]
+        random.shuffle(hosts)
+        hosts = hosts[:5]
         for host in hosts:
-            self.logger.info(f"Executando fuzzing em {host}")
-            
-            # Arquivo temporário para resultados deste host
-            host_output = os.path.join(os.path.dirname(output_file), f"{fuzzer}_{urlparse(host).netloc}.txt")
-            
-            # Executar fuzzer
-            if fuzzer == "ffuf":
-                command = f"ffuf -u {host}/FUZZ -w {wordlist} -mc 200,201,202,203,204,301,302,307,401,403,405 -o {host_output} -of csv"
-            else:  # feroxbuster
-                command = f"feroxbuster -u {host} -w {wordlist} -o {host_output} --silent"
-            
-            result = self.executor.execute(command, timeout=self.timeout)
-            
-            if not result["success"]:
-                self.logger.warning(f"Falha ao executar {fuzzer} em {host}: {result['stderr']}")
-                continue
-            
-            # Verificar se o arquivo foi criado
-            if not os.path.exists(host_output) or os.path.getsize(host_output) == 0:
-                self.logger.warning(f"Nenhum diretório encontrado em {host}")
-                continue
-            
-            # Processar resultados
-            if fuzzer == "ffuf":
-                # Extrair URLs do CSV
-                command = f"tail -n +2 {host_output} | cut -d ',' -f 2 >> {fuzzer_output}"
-            else:  # feroxbuster
-                # Extrair URLs
-                command = f"cat {host_output} | grep -o 'http[s]*://[^ ]*' >> {fuzzer_output}"
-            
-            result = self.executor.execute(command, timeout=10, shell=True)
-            
-            if not result["success"]:
-                self.logger.warning(f"Falha ao processar resultados do {fuzzer} para {host}: {result['stderr']}")
-                continue
-            
-            success = True
-        
-        if not success:
-            self.logger.warning("Nenhum diretório encontrado em nenhum host")
-            return False
-        
-        # Adicionar resultados ao arquivo de diretórios
-        if os.path.exists(fuzzer_output) and os.path.getsize(fuzzer_output) > 0:
-            command = f"cat {fuzzer_output} | sort -u > {output_file}"
-            result = self.executor.execute(command, timeout=10, shell=True)
-            
-            if not result["success"]:
-                self.logger.error(f"Falha ao adicionar resultados do {fuzzer} ao arquivo de diretórios: {result['stderr']}")
-                return False
-            
-            # Contar diretórios
-            with open(output_file, "r", encoding="utf-8", errors="ignore") as f:
-                directories = f.read().splitlines()
-            
-            self.logger.success(f"Encontrados {len(directories)} diretórios com {fuzzer}")
-            return True
-        else:
-            self.logger.warning("Nenhum diretório encontrado")
-            return False
-    
+            host = self._sanitize_url(host)
+            if fuzzer == 'feroxbuster':
+                cmd = f"feroxbuster -u {host} -w {wordlist} -o {output_file}.tmp --silent"
+            else:
+                cmd = f"ffuf -u {host}/FUZZ -w {wordlist} -mc 200,301,302 -o {output_file}.tmp -of csv"
+            self.executor.execute(cmd, timeout=self.timeout, shell=True)
+        self.executor.execute(f"cat {output_file}.tmp | sort -u > {output_file}", shell=True)
+
+    def _extract_parameters(self, input_file: str, output_file: str):
+        params = set()
+        with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                parsed = urlparse(line)
+                params.update(re.findall(r'(\w+)=', parsed.query))
+        with open(output_file, 'w') as f:
+            f.write('\n'.join(sorted(params)))
+
     def _consolidate_results(self, *files) -> Dict:
-        """Consolida resultados com verificação de integridade."""
-        results = {
-            'endpoints': [],
-            'active_endpoints': [],
-            'directories': [],
-            'parameters': [],
-            'stats': {
-                'start_time': self.start_time.isoformat(),
-                'end_time': datetime.now().isoformat()
-            }
+        stats = {
+            'start_time': self.start_time.isoformat(),
+            'end_time': datetime.now().isoformat()
         }
-        
-        # Mapeamento de arquivos para campos
-        file_map = {
-            'endpoints': (files[0], self._process_endpoints),
-            'active': (files[1], self._process_active),
-            'directories': (files[2], self._process_dirs),
-            'parameters': (files[3], self._process_params)
-        }
-        
-        for field, (file_path, processor) in file_map.items():
-            try:
-                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        data = f.read().splitlines()
-                        processed = processor(data)
-                        
-                        results[field] = processed['data']
-                        results['stats'].update(processed['stats'])
-            except Exception as e:
-                self.logger.error(f"Erro processando {file_path}: {str(e)}")
-                
-        # Cálculo de estatísticas finais
-        results['stats']['duration'] = str(
-            datetime.fromisoformat(results['stats']['end_time']) - 
-            datetime.fromisoformat(results['stats']['start_time'])
-        )
-        
-        return results
-
-    def _process_hosts_parallel(self, hosts: List[str], process_func: Callable) -> Dict[str, Any]:
-        """Processa hosts em paralelo com ThreadPoolExecutor."""
         results = {}
-        
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {
-                executor.submit(process_func, host): host
-                for host in hosts
-            }
-            
-            for future in as_completed(futures):
-                host = futures[future]
-                try:
-                    results[host] = future.result()
-                except Exception as e:
-                    self.logger.error(f"Erro processando {host}: {str(e)}")
-                    results[host] = None
-                    
+        names = ['endpoints', 'active_endpoints', 'directories', 'parameters']
+        for name, file in zip(names, files):
+            if os.path.exists(file):
+                with open(file, 'r', encoding='utf-8', errors='ignore') as f:
+                    results[name] = f.read().splitlines()
+            else:
+                results[name] = []
+        stats['duration'] = str(datetime.fromisoformat(stats['end_time']) - datetime.fromisoformat(stats['start_time']))
+        results['stats'] = stats
         return results
-
-if __name__ == "__main__":
-    import json
-    import tempfile
-    
-    # Configuração básica
-    logger = Logger("endpoint_enum_test")
-    logger.setLevel('DEBUG')  # Para ver todos os detalhes
-    
-    # 1. Teste com URLs válidas e inválidas
-    test_urls = [
-        "http://example.com",      # Válido
-        "https://test.com/path",   # Válido com caminho
-        "example.com",             # Inválido (sem esquema)
-        "http://[::1]",            # IPv6 (depende da configuração)
-        "httpx://invalid",         # Esquema inválido
-        ""                         # Vazio
-    ]
-    
-    # 2. Criar arquivo de teste temporário
-    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as tmp:
-        tmp.write("\n".join([
-            "http://test.com",
-            "https://example.com/admin",
-            "invalid-url.com",
-            "http://[::1]"
-        ]))
-        test_file = tmp.name
-    
-    # 3. Executar enumeração
-    try:
-        logger.info("Iniciando testes...")
-        
-        # Cenário 1: Configuração padrão (sem IPv6)
-        enumerator = EndpointEnum(
-            logger=logger,
-            threads=5,
-            timeout=120,
-            allow_ipv6=False
-        )
-        
-        logger.info("\n=== TESTE 1: Configuração padrão ===")
-        results = enumerator.run(
-            hosts_file=test_file,
-            enum_dir="test_output"
-        )
-        
-        logger.info(f"\nResultados 1:\n{json.dumps(results, indent=2)}")
-        
-        # Cenário 2: Com IPv6 habilitado
-        logger.info("\n=== TESTE 2: Com IPv6 habilitado ===")
-        enumerator_ipv6 = EndpointEnum(
-            logger=logger,
-            allow_ipv6=True
-        )
-        
-        results_ipv6 = enumerator_ipv6.run(
-            hosts_file=test_file,
-            enum_dir="test_output_ipv6"
-        )
-        
-        logger.info(f"\nResultados 2 (IPv6):\n{json.dumps(results_ipv6, indent=2)}")
-        
-        # Cenário 3: Teste de validação manual
-        logger.info("\n=== TESTE 3: Validação de URLs ===")
-        for url in test_urls:
-            valid = enumerator._validate_url(url)
-            logger.info(f"URL: {url:<30} | Válida: {valid}")
-            
-    except Exception as e:
-        logger.error(f"Erro durante os testes: {str(e)}")
-        
-    finally:
-        # Limpeza
-        if os.path.exists(test_file):
-            os.remove(test_file)
-        
-        logger.info("Testes concluídos. Verifique os diretórios de saída:")
-        logger.info(f"- Padrão: test_output/")
-        logger.info(f"- IPv6: test_output_ipv6/")

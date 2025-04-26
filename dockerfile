@@ -63,7 +63,13 @@ RUN GOBIN=${TOOLS_DIR} go install github.com/projectdiscovery/httpx/cmd/httpx@la
     GOBIN=${TOOLS_DIR} go install github.com/lc/gau/v2/cmd/gau@latest && \
     GOBIN=${TOOLS_DIR} go install github.com/hakluke/hakrawler@latest && \
     GOBIN=${TOOLS_DIR} go install github.com/ffuf/ffuf@latest && \
-    GOBIN=${TOOLS_DIR} go install github.com/tomnomnom/unfurl@latest
+    GOBIN=${TOOLS_DIR} go install github.com/tomnomnom/unfurl@latest && \
+    go clean -cache -modcache
+
+
+# Instala feroxbuster
+ENV SKIP_FONTS=1
+RUN curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s ${TOOLS_DIR}
 
 # Configura entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]

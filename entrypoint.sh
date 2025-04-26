@@ -21,5 +21,5 @@ while IFS= read -r domain || [ -n "$domain" ]; do
   [ -z "$domain" ] && echo "⚠️ Linha em branco, ignorada" && continue
 
   echo "▶️ Executando Enum para: $domain"
-  python main.py "$domain"
+  python main.py "$domain" -v
 done < "$INPUT_FILE"

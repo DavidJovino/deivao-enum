@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import traceback
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import Dict, Union, Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -246,8 +247,7 @@ class BugBountyEnum:
             
         # Verificação básica de ferramentas críticas
         if not self.check_tools(silent=True):
-            self.logger.error("Ferramentas críticas faltantes. Use --check-only para detalhes.")
-            return False
+            self.logger.error("Ferramentas críticas faltantes, mas continuando assim mesmo...")
             
         return True
 
@@ -375,8 +375,7 @@ class BugBountyEnum:
                 "total": len(results.get("endpoints", [])),
                 "active": len(results.get("active_endpoints", [])),
                 "unique_paths": len(set(
-                    ep["path"] for ep in results.get("endpoints", []) 
-                    if "path" in ep
+                    urlparse(ep).path for ep in results.get("endpoints", []) if ep
                 ))
             },
             "subdomains": {
