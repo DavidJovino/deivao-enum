@@ -65,12 +65,18 @@ class EndpointEnum:
         return host.split('[')[0].strip()
 
     def _sanitize_url(self, raw_url: str) -> str:
-        """Remove códigos ANSI e dados extras de uma URL."""
+        """Remove códigos ANSI, pedaços extras e URLs problemáticas."""
         # Remove caracteres de cor (ANSI)
-        raw_url = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', raw_url)
+        raw_url = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', raw_url) 
         # Remove pedaços que parecem [200] [16766] [exemplo.com]
         url = raw_url.split(' [')[0].strip()
-        return url
+        # Se a URL contiver %E2%80, retorna string vazia
+        if "%E2%80" in url:
+            return ""
+        # Se a URL não contiver o domínio, descarta
+        if self.domain not in raw_url:
+            return ""
+        return raw_url
 
     def _sanitize_file(self, file_path: str):
         """Sanitiza todas as linhas de um arquivo, removendo códigos ANSI, dados extras e mantendo apenas URLs válidas e UTF-8 seguras."""
@@ -163,11 +169,11 @@ class EndpointEnum:
         # URLs históricas
         self._run_historical_urls(hosts_file, endpoints_file)
 
+        # Fuzzing
+        self._run_directory_fuzzing(hosts_file, dirs_file, endpoints_file)
+
         # Ativos
         self._check_active_endpoints(endpoints_file, active_file)
-
-        # Fuzzing
-        self._run_directory_fuzzing(active_file, dirs_file)
 
         # Parâmetros
         self._extract_parameters(endpoints_file, params_file)
@@ -333,25 +339,41 @@ class EndpointEnum:
         self.logger.info(f"Check concluído: {len(valid_lines)} válidos, {len(invalid_lines)} inválidos.")
         self.logger.info(f"Tempo total: {total_time:.2f}s, Média final: {final_rps:.2f} URLs/s")
 
-    def _run_directory_fuzzing(self, hosts_file: str, output_file: str):
+    def _run_directory_fuzzing(self, hosts_file: str, dirs_output_file: str, endpoints_file: str):
         fuzzer = next((t for t in self.tools_status['fuzzers'] if t in self.tools_status['available']), None)
         if not fuzzer:
             return
         wordlists_dir = os.environ.get("WORDLISTS_DIR", "/app/wordlists")
         wordlist = os.path.join(wordlists_dir, "Discovery/Web-Content/common.txt")
+        api_wordlist = os.path.join(wordlists_dir, "Discovery/Web-Content/api_endpoints.txt")
+
         with open(hosts_file, 'r') as f:
             hosts = [self._sanitize_host(line.strip()) for line in f if line.strip()]
         #random.shuffle(hosts)
         #hosts = hosts[:5] -> Opcional caso quiser fuzz em apenas 5 hosts aleatórios
         for host in hosts:
             host = self._sanitize_url(host)
+
+            # Fuzzing comum
             if fuzzer == 'feroxbuster':
-                self.logger.info("Iniciando Fuzzer")
-                cmd = f"feroxbuster -u {host} -w {wordlist} -o {output_file}.tmp --silent"
+                self.logger.info(f"Fuzzing com feroxbuster em {host}")
+                cmd = f"feroxbuster -u {host} -w {wordlist} -o {dirs_output_file}.tmp --silent --filter-status 200,301,302,403,401 "
             else:
-                cmd = f"ffuf -u {host}/FUZZ -w {wordlist} -mc 200,301,302 -o {output_file}.tmp -of csv"
-            self.executor.execute(cmd, timeout=self.timeout, shell=True)
-        self.executor.execute(f"cat {output_file}.tmp | sort -u > {output_file}", shell=True)
+                self.logger.info(f"Fuzzing com ffuf em {host}")
+                cmd = f"ffuf -u {host}/FUZZ -w {wordlist} -mc 200,301,302,403,401 -o {dirs_output_file}.tmp -of csv"
+                self.executor.execute(cmd, timeout=self.timeout, shell=True)
+
+            # Fuzzing de API
+            if fuzzer == 'feroxbuster':
+                self.logger.info(f"Fuzzing API em {host}")
+                cmd = f"feroxbuster -u {host} -w {api_wordlist} -o {dirs_output_file}.tmp_api --silent"
+            else:
+                cmd = f"ffuf -u {host}/FUZZ -w {api_wordlist} -mc 200,301,302,403,401 -o {dirs_output_file}.tmp_api -of csv"
+            self.executor.execute(cmd, timeout=self.timeout, shell=True)           
+
+        # Unir tudo
+        self.executor.execute(f"cat {dirs_output_file}.tmp_common {dirs_output_file}.tmp_api | sort -u > {dirs_output_file}", shell=True)
+        self.executor.execute(f"cat {dirs_output_file} >> {endpoints_file}", shell=True)
 
     def _extract_parameters(self, input_file: str, output_file: str):
         params = set()

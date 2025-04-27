@@ -610,20 +610,13 @@ def main():
         args = parse_args()
         enum = BugBountyEnum(args)
         
-        if args.check_only:
-            sys.exit(0 if enum.check_tools() else 1)
-        elif args.install:
-            sys.exit(0 if enum.install_tools() else 1)
-            
-        success = enum.run()
-        sys.exit(0 if success else 1)
+        if not enum.run():
+            sys.exit(1)
         
     except Exception as e:
         print(f"Erro crítico: {str(e)}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        import os
-        os._exit(0) 
+        traceback.print_exc()
+        sys.exit(2)
 
 if __name__ == "__main__":
     main()
