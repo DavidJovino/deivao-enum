@@ -266,7 +266,8 @@ class BugBountyEnum:
         endpoint_enum = EndpointEnum(
             logger=self.logger,
             threads=self.args.threads,
-            timeout=self.args.timeout
+            timeout=self.args.timeout,
+            domain=self.domain
         )
 
         return endpoint_enum.run(
@@ -320,7 +321,7 @@ class BugBountyEnum:
         report_data = {
             "meta": {
                 "title": f"Relatório de Enumeração - {self.domain}",
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "date": datetime.now().strftime("%d-%m-%Y %H:%M:%S"),
                 "duration": str(datetime.now() - self.start_time),
                 "domain": self.domain,
                 "command": " ".join(sys.argv)
@@ -357,8 +358,14 @@ class BugBountyEnum:
                     task.result()
                 except Exception as e:
                     self.logger.error(f"Erro ao gerar relatório: {str(e)}")
-        
-        self.logger.success(f"Relatório principal gerado: {main_report}")
+
+            executor.shutdown(wait=True)  # Finalizando todas as Threads
+
+        # Verificar se há tarefas pendentes
+        pending = [t for t in format_tasks if not t.done()]
+        if pending:
+            self.logger.warning(f"{len(pending)} tarefas de relatório pendentes")
+
         return main_report
 
     def _calculate_stats(self, results: Dict) -> Dict:
@@ -377,10 +384,6 @@ class BugBountyEnum:
                 "unique_paths": len(set(
                     urlparse(ep).path for ep in results.get("endpoints", []) if ep
                 ))
-            },
-            "subdomains": {
-                "total": len(results.get("subdomains", [])),
-                "live": len(results.get("live_subdomains", []))
             },
             "processing_time": {
                 "start": self.start_time.isoformat(),
@@ -406,7 +409,6 @@ class BugBountyEnum:
         summary = [
             f"Domínio: {self.domain}",
             f"Duração: {duration:.2f} segundos ({duration/60:.2f} minutos)",
-            f"Subdomínios: {stats['subdomains']['total']} (live: {stats['subdomains']['live']})",
             f"Endpoints: {stats['endpoints']['total']} (ativos: {stats['endpoints']['active']})",
             f"Caminhos únicos: {stats['endpoints']['unique_paths']}",
             f"Relatório: {report_file}",
@@ -424,6 +426,7 @@ class BugBountyEnum:
             report_file: Caminho para o relatório gerado
         """
         try:
+            self.notify_manager.notify(..., timeout=10)  # 10 segundos de timeout
             stats = self._calculate_stats(results)
             duration = stats["processing_time"]["duration_seconds"]
             
@@ -446,8 +449,8 @@ class BugBountyEnum:
                 attachments=attachments,
                 priority="high"
             )
-        except Exception as e:
-            self.logger.error(f"Falha ao enviar notificação de conclusão: {str(e)}")
+        except TimeoutError:
+            self.logger.warning("Timeout ao enviar notificação")
 
     def check_tools(self, silent: bool = False) -> bool:
         """Verifica ferramentas necessárias.
@@ -618,6 +621,9 @@ def main():
     except Exception as e:
         print(f"Erro crítico: {str(e)}", file=sys.stderr)
         sys.exit(1)
+    finally:
+        import os
+        os._exit(0) 
 
 if __name__ == "__main__":
     main()

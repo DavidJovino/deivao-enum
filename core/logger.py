@@ -96,7 +96,7 @@ class Logger:
         elif output_dir:
             # Se output_dir foi especificado, criar arquivo com nome padrão
             os.makedirs(output_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
             final_log_file = os.path.join(output_dir, f"{name}_{timestamp}.log")
         else:
             final_log_file = None

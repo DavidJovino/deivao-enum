@@ -9,27 +9,26 @@ Versão corrigida com:
 
 import os
 import re
-import random
 import shlex
+import time
+import multiprocessing
 from tqdm import tqdm
-from pathlib import Path
 from urllib.parse import urlparse
 from typing import List, Dict, Optional, Callable, Any
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.logger import Logger
 from core.executor import CommandExecutor
-from tools.tool_checker import ToolChecker
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class EndpointEnum:
-    def __init__(self, logger: Optional[Logger] = None, threads: int = 10, timeout: int = 300, allow_ipv6: bool = False):
+    def __init__(self, logger: Optional[Logger] = None, threads: int = 10, timeout: int = 300, allow_ipv6: bool = False, domain: Optional[str] = None):
         self.logger = logger or Logger("endpoint_enum")
         self.executor = CommandExecutor(self.logger)
         self.threads = threads
         self.timeout = timeout
         self.allow_ipv6 = allow_ipv6
         self.start_time = datetime.now()
-
+        self.domain = domain
         self.tools_status = self._verify_tools()
         self.endpoints: List[str] = []
         self.active_endpoints: List[str] = []
@@ -38,7 +37,7 @@ class EndpointEnum:
 
     def _verify_tools(self) -> Dict:
         tools_to_check = {
-            'katana': 'katana -version',
+            'katana': 'katana -h',
             'hakrawler': 'hakrawler -help',
             'httpx': 'httpx -version',
             'ffuf': 'ffuf -h',
@@ -74,19 +73,60 @@ class EndpointEnum:
         return url
 
     def _sanitize_file(self, file_path: str):
-        """Sanitiza todas as linhas de um arquivo, removendo códigos ANSI e dados extras, mantendo apenas URLs válidas."""
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-
+        """Sanitiza todas as linhas de um arquivo, removendo códigos ANSI, dados extras e mantendo apenas URLs válidas e UTF-8 seguras."""
         sanitized_lines = []
-        for line in lines:
-            clean_line = self._sanitize_url(line.strip())
-            if clean_line and self._validate_url(clean_line):  # <<< AQUI
-                sanitized_lines.append(clean_line)
+
+        with open(file_path, 'rb') as f:
+            raw_lines = f.readlines()
+
+        for raw_line in raw_lines:
+            try:
+                # Tentar decodificar forçadamente em utf-8 ignorando erros
+                line = raw_line.decode('utf-8', errors='ignore').strip()
+
+                if not line:
+                    continue
+
+                clean_line = self._sanitize_url(line)
+
+                if clean_line and self._validate_url(clean_line):
+                    sanitized_lines.append(clean_line)
+
+            except Exception as e:
+                self.logger.warning(f"Erro ao sanitizar linha: {e}")
 
         with open(file_path, 'w', encoding='utf-8') as f:
             for line in sanitized_lines:
                 f.write(line + '\n')
+
+        self.logger.info(f"Sanitização finalizada: {len(sanitized_lines)} URLs válidas mantidas.")
+
+    def _sanitize_file_strong(self, file_path: str):
+        """Sanitiza fortemente todas as linhas de um arquivo, removendo bytes inválidos e URLs ruins."""
+        sanitized_lines = []
+
+        with open(file_path, 'rb') as f:
+            raw_lines = f.readlines()
+
+        for raw_line in raw_lines:
+            try:
+                line = raw_line.decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                clean_line = self._sanitize_url(line)
+
+                if clean_line and self._validate_url(clean_line):
+                    sanitized_lines.append(clean_line)
+
+            except Exception as e:
+                self.logger.warning(f"Erro ao sanitizar linha: {e}")
+
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for line in sanitized_lines:
+                f.write(line + '\n')
+
+        self.logger.info(f"Sanitização completa: {len(sanitized_lines)} URLs válidas mantidas em {file_path}")
 
     def _ensure_url_scheme(self, url: str) -> str:
         url = url.strip()
@@ -135,38 +175,108 @@ class EndpointEnum:
         return self._consolidate_results(endpoints_file, active_file, dirs_file, params_file)
 
     def _run_crawlers(self, hosts_file: str, output_file: str):
+        temp_files = []
         if 'katana' in self.tools_status['available']:
-            cmd = f"katana -list {hosts_file} -o {output_file}.katana"
+            katana_file = f"{output_file}.katana"
+            self.logger.info("Iniciando Katana")
+            cmd = f"katana -list {hosts_file} -o {katana_file}"
             self.executor.execute(cmd, timeout=self.timeout)
+            if os.path.exists(katana_file):
+                temp_files.append(katana_file)
+        
         if 'hakrawler' in self.tools_status['available']:
-            cmd = f"cat {hosts_file} | hakrawler -t {self.threads} > {output_file}.hakrawler"
+            hakrawler_file = f"{output_file}.hakrawler"
+            self.logger.info("Iniciando Hakrawler")
+            cmd = f"cat {hosts_file} | hakrawler -t {self.threads} > {hakrawler_file}"
             self.executor.execute(cmd, timeout=self.timeout, shell=True)
-        # Combinar resultados
-        self.executor.execute(f"cat {output_file}.katana {output_file}.hakrawler | sort -u > {output_file}", shell=True)
+            if os.path.exists(hakrawler_file):
+                temp_files.append(hakrawler_file)
+        
+        if temp_files:
+            self.executor.execute(f"cat {' '.join(temp_files)} | sort -u > {output_file}", shell=True)
+            if os.path.exists(output_file):
+                with open(output_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                self.logger.info(f"Total de URLs coletadas no crawling: {len(lines)}")
 
     def _run_historical_urls(self, hosts_file: str, output_file: str):
-        tool = next((t for t in self.tools_status['historical'] if t in self.tools_status['available']), None)
-        if tool == 'gau':
-            cmd = f"cat {hosts_file} | cut -d/ -f3 | gau > {output_file}.gau"
-        elif tool == 'waybackurls':
-            cmd = f"cat {hosts_file} | cut -d/ -f3 | waybackurls > {output_file}.wayback"
-        else:
+        """Coleta URLs históricas usando gau ou waybackurls e consolida os resultados"""
+        if not self.tools_status['historical']:
+            self.logger.warning("Nenhuma ferramenta de histórico disponível (gau/waybackurls)")
             return
-        self.executor.execute(cmd, timeout=self.timeout, shell=True)
-        self.executor.execute(f"cat {output_file}* | sort -u >> {output_file}", shell=True)
 
-    def _check_active_endpoints(self, input_file: str, output_file: str, max_threads: int = 30):
+        # Usar arquivo temporário único
+        temp_file = f"{output_file}.historical.tmp"
+        
+        try:
+            # Limpar arquivo temporário se existir
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+            # Executar cada ferramenta disponível
+            for tool in self.tools_status['historical']:
+                if tool not in self.tools_status['available']:
+                    continue
+                    
+                if tool == 'gau':
+                    self.logger.info("Iniciando Gau")
+                    cmd = f"cat {hosts_file} | cut -d/ -f3 | gau --threads {self.threads} > {temp_file}.{tool}"
+                elif tool == 'waybackurls':
+                    self.logger.info("Iniciando Waybackurl")
+                    cmd = f"cat {hosts_file} | cut -d/ -f3 | waybackurls > {temp_file}.{tool}"
+                else:
+                    continue
+                    
+                self.executor.execute(cmd, timeout=self.timeout, shell=True)
+                
+                # Adicionar resultados ao arquivo temporário principal
+                if os.path.exists(f"{temp_file}.{tool}"):
+                    self.executor.execute(f"cat {temp_file}.{tool} >> {temp_file}", shell=True)
+                    os.remove(f"{temp_file}.{tool}")  # Limpar arquivo temporário
+
+            # Processar e consolidar resultados finais
+            if os.path.exists(temp_file):
+                # Remover duplicatas e URLs inválidas
+                self._sanitize_file(temp_file)
+                
+                # Adicionar ao arquivo de saída principal (sem duplicar conteúdo existente)
+                self.executor.execute(
+                    f"cat {temp_file} | sort -u | grep -Fxv -f {output_file} 2>/dev/null >> {output_file}",
+                    shell=True
+                )
+                with open(output_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                self.logger.info(f"Total de URLs históricas coletadas: {len(lines)}")
+                
+                os.remove(temp_file)  # Limpeza final
+                
+        except Exception as e:
+            self.logger.error(f"Erro ao processar URLs históricas: {str(e)}")
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+    def _check_active_endpoints(self, input_file: str, output_file: str, max_threads: int = None, thread_multiplier: int = 5, max_rps: int = 10):
         """
-        Sanitiza e valida endpoints individualmente usando múltiplas threads para alta performance, com barra de progresso.
+        Sanitiza e valida endpoints usando múltiplas threads baseadas na CPU, com controle de requests por segundo (RPS).
         """
-        self._sanitize_file(input_file)
+        # Sanitização hardcore antes de tudo
+        self.logger.info(f"Sanitizando {input_file}...")
+        self._sanitize_file_strong(input_file)
 
         with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
             lines = [line.strip() for line in f if line.strip()]
 
+        self.logger.info(f"Total de URLs para validação: {len(lines)}")
+
+        # Detectar CPUs se max_threads não for passado
+        if max_threads is None:
+            cpu_count = multiprocessing.cpu_count()
+            max_threads = cpu_count * thread_multiplier
+            self.logger.info(f"Detectado {cpu_count} CPUs. Usando {max_threads} threads (fator {thread_multiplier}x).")
+
         def validate_url(url):
             try:
-                command = f"echo {shlex.quote(url)} | httpx -silent -status-code -content-length -title"
+                command = f"echo {shlex.quote(url)} | httpx -silent -threads 20 -rate-limit {max_rps} -status-code -content-length -title -tech-detect -web-server -response-time -follow-host-redirects -max-redirects 2 -no-color -ports 80,443,8009,8080,8081,8090,8180,9443"
                 result = self.executor.execute(command, timeout=self.timeout, shell=True)
                 if result["success"] and result["stdout"].strip():
                     return (url, True)
@@ -178,16 +288,32 @@ class EndpointEnum:
         valid_lines = []
         invalid_lines = []
 
+        start_time = time.time()
+        completed = 0
+
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = [executor.submit(validate_url, url) for url in lines]
-            
-            # USAR tqdm para barra de progresso!
+
             for future in tqdm(as_completed(futures), total=len(futures), desc="Validando endpoints", unit="URL"):
-                url, is_valid = future.result()
-                if is_valid:
-                    valid_lines.append(url)
-                else:
-                    invalid_lines.append(url)
+                try:
+                    url, is_valid = future.result()
+                    if is_valid:
+                        valid_lines.append(url)
+                    else:
+                        invalid_lines.append(url)
+                except Exception as e:
+                    self.logger.warning(f"Erro ao processar future: {e}")
+                    invalid_lines.append("URL desconhecida com erro")
+
+                completed += 1
+                elapsed = time.time() - start_time
+
+                if elapsed > 0:
+                    rps = completed / elapsed
+                    if rps > max_rps:
+                        sleep_time = (completed / max_rps) - elapsed
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
 
         # Salvar os válidos
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -202,7 +328,10 @@ class EndpointEnum:
                     f.write(url + '\n')
             self.logger.info(f"Alguns endpoints inválidos foram encontrados. Veja: {error_file}")
 
-        self.logger.info(f"Check concluído: {len(valid_lines)} válidos, {len(invalid_lines)} inválidos (threads: {max_threads})")
+        total_time = time.time() - start_time
+        final_rps = completed / total_time if total_time > 0 else 0
+        self.logger.info(f"Check concluído: {len(valid_lines)} válidos, {len(invalid_lines)} inválidos.")
+        self.logger.info(f"Tempo total: {total_time:.2f}s, Média final: {final_rps:.2f} URLs/s")
 
     def _run_directory_fuzzing(self, hosts_file: str, output_file: str):
         fuzzer = next((t for t in self.tools_status['fuzzers'] if t in self.tools_status['available']), None)
@@ -212,11 +341,12 @@ class EndpointEnum:
         wordlist = os.path.join(wordlists_dir, "Discovery/Web-Content/common.txt")
         with open(hosts_file, 'r') as f:
             hosts = [self._sanitize_host(line.strip()) for line in f if line.strip()]
-        random.shuffle(hosts)
-        hosts = hosts[:5]
+        #random.shuffle(hosts)
+        #hosts = hosts[:5] -> Opcional caso quiser fuzz em apenas 5 hosts aleatórios
         for host in hosts:
             host = self._sanitize_url(host)
             if fuzzer == 'feroxbuster':
+                self.logger.info("Iniciando Fuzzer")
                 cmd = f"feroxbuster -u {host} -w {wordlist} -o {output_file}.tmp --silent"
             else:
                 cmd = f"ffuf -u {host}/FUZZ -w {wordlist} -mc 200,301,302 -o {output_file}.tmp -of csv"
