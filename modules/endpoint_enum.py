@@ -12,6 +12,9 @@ import re
 import shlex
 import time
 import multiprocessing
+import socket
+import subprocess
+import tempfile
 from tqdm import tqdm
 from urllib.parse import urlparse
 from typing import List, Dict, Optional, Callable, Any
@@ -263,23 +266,60 @@ class EndpointEnum:
 
     def _check_active_endpoints(self, input_file: str, output_file: str, max_threads: int = None, thread_multiplier: int = 5, max_rps: int = 10):
         """
-        Sanitiza e valida endpoints usando múltiplas threads baseadas na CPU, com controle de requests por segundo (RPS).
+        Usa o massdns para resolver os subdomínios e depois o httpx para validar os endpoints ativos.
         """
-        # Sanitização hardcore antes de tudo
+        # === 1. Sanitizar entrada ===
         self.logger.info(f"Sanitizando {input_file}...")
         self._sanitize_file_strong(input_file)
 
         with open(input_file, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [line.strip() for line in f if line.strip()]
+            all_lines = [line.strip() for line in f if line.strip()]
 
-        self.logger.info(f"Total de URLs para validação: {len(lines)}")
+        self.logger.info(f"Total de subdomínios para verificação DNS: {len(all_lines)}")
 
-        # Detectar CPUs se max_threads não for passado
+        # === 2. Rodar massdns ===
+        self.logger.info("Executando massdns para resolver subdomínios...")
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_output:
+            massdns_output = tmp_output.name
+
+        massdns_command = [
+            "massdns",
+            "-r", "tools/massdns/resolvers.txt",
+            "-t", "A",
+            "-o", "S",
+            "-w", massdns_output,
+            input_file
+        ]
+        subprocess.run(massdns_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        resolved_hosts = set()
+        with open(massdns_output, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts:
+                    resolved_hosts.add(parts[0])
+
+        os.remove(massdns_output)
+
+        self.logger.info(f"{len(resolved_hosts)} subdomínios resolvidos com sucesso.")
+
+        # === 3. Criar URLs http para testar com httpx ===
+        lines = []
+        for host in resolved_hosts:
+            lines.append(f"http://{host}")
+            lines.append(f"https://{host}")
+
+        if not lines:
+            self.logger.warning("Nenhum subdomínio resolvido. Encerrando validação.")
+            return
+
+        # === 4. Detectar CPUs se max_threads não for passado ===
         if max_threads is None:
             cpu_count = multiprocessing.cpu_count()
             max_threads = cpu_count * thread_multiplier
             self.logger.info(f"Detectado {cpu_count} CPUs. Usando {max_threads} threads (fator {thread_multiplier}x).")
 
+        # === 5. Função de validação com httpx ===
         def validate_url(url):
             try:
                 command = f"echo {shlex.quote(url)} | httpx -silent -threads 20 -rate-limit {max_rps} -status-code -content-length -title -tech-detect -web-server -response-time -follow-host-redirects -max-redirects 2 -no-color -ports 80,443,8009,8080,8081,8090,8180,9443"
@@ -291,6 +331,7 @@ class EndpointEnum:
                 self.logger.warning(f"Erro ao validar {url}: {e}")
                 return (url, False)
 
+        # === 6. Execução paralela com RPS controlado ===
         valid_lines = []
         invalid_lines = []
 
@@ -313,7 +354,6 @@ class EndpointEnum:
 
                 completed += 1
                 elapsed = time.time() - start_time
-
                 if elapsed > 0:
                     rps = completed / elapsed
                     if rps > max_rps:
@@ -321,12 +361,11 @@ class EndpointEnum:
                         if sleep_time > 0:
                             time.sleep(sleep_time)
 
-        # Salvar os válidos
+        # === 7. Salvar resultados ===
         with open(output_file, 'w', encoding='utf-8') as f:
             for url in valid_lines:
                 f.write(url + '\n')
 
-        # Salvar os inválidos
         if invalid_lines:
             error_file = output_file.replace('.txt', '_erros.txt')
             with open(error_file, 'w', encoding='utf-8') as f:

@@ -27,7 +27,7 @@ COPY requirements.txt /app/requirements.txt
 # Instala dependências do sistema
 RUN apt update && apt install -y --no-install-recommends \
     curl git wget unzip jq ruby ruby-dev build-essential \
-    python3-pip libpcap-dev libssl-dev zlib1g-dev && \
+    python3-pip libpcap-dev libldns-dev libssl-dev zlib1g-dev && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -70,6 +70,11 @@ RUN GOBIN=${TOOLS_DIR} go install github.com/projectdiscovery/httpx/cmd/httpx@la
 # Instala feroxbuster
 ENV SKIP_FONTS=1
 RUN curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s ${TOOLS_DIR}
+
+# Clonar e compilar o MassDNS
+RUN git clone https://github.com/blechschmidt/massdns.git /opt/massdns && \
+    cd /opt/massdns && make && \
+    ln -s /opt/massdns/bin/massdns /usr/local/bin/massdns
 
 # Configura entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
