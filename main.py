@@ -29,6 +29,10 @@ from core.logger import Logger
 from core.executor import CommandExecutor
 from tools.tool_checker import ToolChecker
 from modules.endpoint_enum import EndpointEnum
+from modules.vuln_scan import VulnScan
+from modules.specific_tests import SpecificTests
+from modules.js_analysis import JSAnalysis
+from modules.infra_checks import InfraChecks
 from reporting.report_generator import ReportGenerator
 from reporting.notify import NotifyManager
 from config.settings import (
@@ -105,10 +109,12 @@ class BugBountyEnum:
             
             # Criar estrutura de diretórios
             dir_structure = {
-                "enum": ["subdomains", "endpoints", "screenshots"],
-                "reports": [],
-                "logs": [],
-                "temp": []
+                "enum":     ["subdomains", "endpoints", "screenshots"],
+                "scan":     [],
+                "specific": [],
+                "reports":  [],
+                "logs":     [],
+                "temp":     []
             }
             
             for main_dir, sub_dirs in dir_structure.items():
@@ -212,12 +218,50 @@ class BugBountyEnum:
                 return False
                 
             # Executar enumeração de endpoints
-            endpoint_results = self._run_endpoint_enumeration()
-            if not endpoint_results:
-                return False
-                
+            if self.args.skip_enum:
+                active_file = os.path.join(self.output_dir, "enum", "active_endpoints.txt")
+                if not os.path.exists(active_file):
+                    self.logger.error(f"--skip-enum requer active_endpoints.txt em: {active_file}")
+                    return False
+                with open(active_file) as f:
+                    urls = [l.strip() for l in f if l.strip()]
+                endpoint_results = {"endpoints": urls, "active_endpoints": urls, "success": True}
+                self.logger.info(f"--skip-enum: usando {len(urls)} endpoints existentes")
+            else:
+                endpoint_results = self._run_endpoint_enumeration()
+                if not endpoint_results:
+                    return False
+
+            # Varredura de vulnerabilidades (nuclei, dalfox, sqlmap, nikto, naabu)
+            scan_results = {}
+            if not self.args.skip_scan:
+                scan_results = self._run_vuln_scan() or {}
+
+            # Testes específicos (open redirect, LFI, SSRF, CORS, takeover)
+            specific_results = {}
+            if not self.args.skip_specific:
+                specific_results = self._run_specific_tests() or {}
+
+            # Verificações de infraestrutura (.git, debug mode, cookies, rate limit, etc.)
+            infra_results = {}
+            if not getattr(self.args, 'skip_infra', False):
+                infra_results = self._run_infra_checks(endpoint_results) or {}
+
+            # Análise de JavaScript (LinkFinder + SecretFinder)
+            js_results = {}
+            if not getattr(self.args, 'skip_js', False):
+                js_results = self._run_js_analysis() or {}
+
+            # Combinar todos os resultados para o relatório
+            combined_results = {
+                **endpoint_results,
+                "scan":     scan_results,
+                "specific": specific_results,
+                "js":       js_results,
+            }
+
             # Processar resultados e gerar relatórios
-            report_file = self._process_results(endpoint_results)
+            report_file = self._process_results(combined_results)
             
             # Notificação de conclusão
             if self.args.notify:
@@ -273,6 +317,62 @@ class BugBountyEnum:
         return endpoint_enum.run(
             hosts_file=subdomains_file,
             output_dir=os.path.join(self.output_dir, "enum")
+        )
+
+    def _run_js_analysis(self) -> Optional[Dict]:
+        """Executa análise de arquivos JS nos endpoints ativos.
+
+        Returns:
+            Optional[Dict]: Resultados da análise JS ou None em caso de falha
+        """
+        self.logger.banner("Análise de JavaScript (LinkFinder + SecretFinder)")
+
+        active_file = os.path.join(self.output_dir, "enum", "active_endpoints.txt")
+        if not os.path.exists(active_file):
+            self.logger.warning(
+                f"active_endpoints.txt não encontrado em {active_file} — js_analysis pulado"
+            )
+            return None
+
+        js_analysis = JSAnalysis(
+            logger=self.logger,
+            threads=self.args.threads,
+            timeout=self.args.timeout,
+        )
+
+        return js_analysis.run(
+            input_file=active_file,
+            output_dir=os.path.join(self.output_dir, "js"),
+        )
+
+    def _run_infra_checks(self, endpoint_results: Dict) -> Optional[Dict]:
+        """Verifica exposição de infraestrutura: .git, debug mode, cookies, rate limit, etc."""
+        self.logger.banner("Verificações de Infraestrutura e Configuração")
+
+        # Extrai base URLs únicas dos endpoints ativos
+        active = endpoint_results.get("active_endpoints", [])
+        base_urls = set()
+        for url in active:
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(url)
+                base_urls.add(f"{p.scheme}://{p.netloc}")
+            except Exception:
+                pass
+
+        if not base_urls:
+            self.logger.warning("Nenhuma URL base encontrada para infra checks")
+            return None
+
+        infra = InfraChecks(
+            logger=self.logger,
+            threads=self.args.threads,
+            timeout=self.args.timeout,
+        )
+
+        return infra.run(
+            targets=sorted(base_urls),
+            output_dir=os.path.join(self.output_dir, "infra"),
         )
 
     def _locate_subdomains_file(self) -> Optional[str]:
@@ -452,6 +552,58 @@ class BugBountyEnum:
         except TimeoutError:
             self.logger.warning("Timeout ao enviar notificação")
 
+    def _run_vuln_scan(self) -> Optional[Dict]:
+        """Executa a varredura de vulnerabilidades nos endpoints ativos.
+
+        Returns:
+            Optional[Dict]: Resultados do vuln_scan ou None em caso de falha
+        """
+        self.logger.banner("Varredura de Vulnerabilidades")
+
+        active_file = os.path.join(self.output_dir, "enum", "active_endpoints.txt")
+        if not os.path.exists(active_file):
+            self.logger.warning(
+                f"active_endpoints.txt não encontrado em {active_file} — vuln_scan pulado"
+            )
+            return None
+
+        vuln_scan = VulnScan(
+            logger=self.logger,
+            threads=self.args.threads,
+            timeout=self.args.timeout,
+        )
+
+        return vuln_scan.run(
+            input_file=active_file,
+            output_dir=os.path.join(self.output_dir, "scan"),
+        )
+
+    def _run_specific_tests(self) -> Optional[Dict]:
+        """Executa os testes específicos de vulnerabilidade (PoC).
+
+        Returns:
+            Optional[Dict]: Resultados dos testes ou None em caso de falha
+        """
+        self.logger.banner("Testes Específicos de Vulnerabilidade")
+
+        active_file = os.path.join(self.output_dir, "enum", "active_endpoints.txt")
+        if not os.path.exists(active_file):
+            self.logger.warning(
+                f"active_endpoints.txt não encontrado em {active_file} — specific_tests pulado"
+            )
+            return None
+
+        specific_tests = SpecificTests(
+            logger=self.logger,
+            threads=self.args.threads,
+            timeout=self.args.timeout,
+        )
+
+        return specific_tests.run(
+            input_file=active_file,
+            output_dir=os.path.join(self.output_dir, "specific"),
+        )
+
     def check_tools(self, silent: bool = False) -> bool:
         """Verifica ferramentas necessárias.
         
@@ -601,7 +753,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Instalar ferramentas necessárias automaticamente"
     )
-    
+
+    # Controle das etapas de varredura
+    parser.add_argument(
+        "--skip-enum",
+        action="store_true",
+        help="Pular enumeração de endpoints (usa active_endpoints.txt existente)"
+    )
+    parser.add_argument(
+        "--skip-scan",
+        action="store_true",
+        help="Pular varredura de vulnerabilidades (nuclei, dalfox, sqlmap, nikto, naabu)"
+    )
+    parser.add_argument(
+        "--skip-specific",
+        action="store_true",
+        help="Pular testes específicos (open redirect, LFI, SSRF, CORS, takeover)"
+    )
+    parser.add_argument(
+        "--skip-js",
+        action="store_true",
+        help="Pular análise de JavaScript (LinkFinder/SecretFinder)"
+    )
+
     return parser.parse_args()
 
 def main():
